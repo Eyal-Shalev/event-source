@@ -1,4 +1,3 @@
-import { createHttpError } from "https://deno.land/x/oak@v7.3.0/httpError.ts";
 import {
   Application,
   Router,

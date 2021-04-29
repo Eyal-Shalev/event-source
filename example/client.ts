@@ -1,10 +1,10 @@
 import { EventSource, ReadyState } from "../mod.ts";
 
-const events = new EventSource("http://localhost:4545/sse");
+const events = new EventSource("http://localhost:8888/message2.ts");
 
-events.onopen = (event) => console.debug(event.toString());
-events.onmessage = (event) => console.info(event.toString());
-events.onerror = (event) => console.error(event.toString());
+// events.onopen = (event) => console.debug(event.toString());
+events.onmessage = (event) => console.info(event);
+// events.onerror = (event) => console.error(event.toString());
 
 const sleep = (delay: number) => (
   new Promise<void>((resolve) => {
@@ -13,5 +13,5 @@ const sleep = (delay: number) => (
 );
 
 while (events.readyState !== ReadyState.CLOSED) {
-  await sleep(500)
+  await sleep(500);
 }
