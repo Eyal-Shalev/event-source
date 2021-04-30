@@ -1,6 +1,6 @@
 import { EventSource, ReadyState } from "../mod.ts";
 
-const events = new EventSource("http://localhost:8888/message2.ts");
+const events = new EventSource("http://localhost/message2.ts");
 
 // events.onopen = (event) => console.debug(event.toString());
 events.onmessage = (event) => console.info(event);

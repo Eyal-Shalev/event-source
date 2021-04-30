@@ -1,9 +1,9 @@
-abstract class BaseEvent extends Event {
+abstract class BaseEvent<T> extends CustomEvent<T> {
   // TODO: How should cancelable events be handled?
   readonly cancelable = false;
 }
 
-export class OpenEvent extends BaseEvent {
+export class OpenEvent extends BaseEvent<void> {
   constructor(options?: EventInit) {
     super("open", options);
   }
@@ -13,46 +13,53 @@ export class OpenEvent extends BaseEvent {
   }
 }
 
-export class ErrorEvent extends BaseEvent {
+export class ErrorEvent extends BaseEvent<Error | string> {
   constructor(public readonly err?: Error | string, options?: EventInit) {
-    super("error", options);
+    super("error", { ...options, detail: err });
   }
 
-  toString(): string {
-    if (typeof this.err === "string") return `Error: ${this.err}`;
-    return this.err?.stack || this.err?.message || "Error";
-  }
+  // toString(): string {
+  //   if (typeof this.err === "string") return `Error: ${this.err}`;
+  //   return this.err?.stack || this.err?.message || "Error";
+  // }
 }
 
-export class MessageEvent extends BaseEvent {
+export type MessageEventDetail = {
+  event: string;
+  data: string;
+  origin: string;
+  lastEventID?: string;
+};
+export class MessageEvent extends BaseEvent<MessageEventDetail> {
   constructor(
-    eventType: string,
+    event: string,
     public readonly data: string,
     public readonly origin: string,
     public readonly lastEventID?: string,
     options?: EventInit,
   ) {
-    super(eventType === "" ? "message" : eventType, options);
+    if (event === "") event = "message";
+    super(event, { ...options, detail: { event, data, origin, lastEventID } });
   }
 
   get [Symbol.toStringTag](): string {
     return `${this.constructor.name}(${this.type})`;
   }
 
-  toString(): string {
-    return `${this[Symbol.toStringTag]}: ${
-      JSON.stringify(
-        {
-          event: this.type,
-          data: this.data,
-          origin: this.origin,
-          lastEventID: this.lastEventID,
-        },
-        null,
-        "  ",
-      )
-    }`;
-  }
+  // toString(): string {
+  //   return `${this[Symbol.toStringTag]}: ${
+  //     JSON.stringify(
+  //       {
+  //         event: this.type,
+  //         data: this.data,
+  //         origin: this.origin,
+  //         lastEventID: this.lastEventID,
+  //       },
+  //       null,
+  //       "  ",
+  //     )
+  //   }`;
+  // }
 }
 
 export type EventListener<TEvent extends Event = Event> =

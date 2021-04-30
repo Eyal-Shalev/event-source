@@ -27,66 +27,56 @@ export interface EventSourceInit {
  * @see {@link https://developer.mozilla.org/en-US/docs/Web/API/EventSource}
  */
 export class EventSource {
+  public readonly [Symbol.toStringTag] = "EventSource";
+  public readonly withCredentials: boolean;
+  public get url() {
+    return this.#url;
+  }
+
+  get readyState(): ReadyState {
+    return this.#readyState;
+  }
+
   #readyState = ReadyState.CONNETING;
-  readonly url: URL;
-  readonly [Symbol.toStringTag] = "EventSource";
-  #abortController: AbortController;
+  #url: URL;
   #reconnectionTime: number;
   #lastEventID = "";
-  #withCredentials: boolean;
+  readonly #controller = new AbortController();
 
   constructor(url: string, options: EventSourceInit = {}) {
-    this.url = new URL(url);
+    this.#url = new URL(url);
     this.#reconnectionTime = options.reconnectionTime || 1000;
-    this.#withCredentials = options.withCredentials || false;
+    this.withCredentials = options.withCredentials || false;
 
     // Cleanup on unload.
-    globalThis.addEventListener("unload", () => this.close());
+    globalThis.addEventListener("unload", () => this.#abort());
 
-    // Start the request and update the #abortController.
-    this.#abortController = this.startRequest();
+    this.#controller = new AbortController();
+    this.#connect();
   }
 
-  get fetchCredentials() {
-    return this.#withCredentials ? "include" : "same-origin";
-  }
-
-  protected startRequest(): AbortController {
-    const controller = new AbortController();
-
-    fetch(this.url, {
+  #connect = async () => {
+    const response = await fetch(this.#url, {
       mode: "cors",
-      credentials: this.fetchCredentials,
+      credentials: this.withCredentials ? "include" : "same-origin",
       cache: "no-store",
-      signal: controller.signal,
+      signal: this.#controller.signal,
       headers: this.headers,
-    }).then((response) => {
-      if (response.status === 204) {
-        // Close when HTTP 204 (No Content response code) is received.
-        this.close();
-        return;
-      }
-      if (!response.ok || response.status !== 200) {
-        return Promise.reject(`${response.status}: ${response.statusText}`);
-      }
-
-      const contentType = response.headers.get("Content-Type");
-      if (contentType !== "text/event-stream") {
-        return Promise.reject(
-          `"Content-Type" header is ${contentType} and not "text/event-stream"`,
-        );
-      }
-
-      queueTask(() => this.#announceConnection());
-
-      return this.processResonse(response);
-    }).catch((reason) => {
-      console.error(reason);
-      this.close();
     });
 
-    return controller;
-  }
+    try {
+      await this.#rejectInvalidResponse(response);
+    } catch (e) {
+      this.#abort(e);
+      return;
+    }
+
+    queueTask(this.#announceConnection);
+
+    await this.#processResonse(response);
+
+    await this.#reconnect();
+  };
 
   protected get headers(): HeadersInit {
     const ret: HeadersInit = {
@@ -96,17 +86,56 @@ export class EventSource {
     return ret;
   }
 
-  protected async processResonse(response: Response) {
+  #rejectInvalidResponse = (response: Response): Promise<Response> => {
+    if (response.status === 204) {
+      // Close when HTTP 204 (No Content response code) is received.
+      this.#abort();
+      return Promise.reject(
+        new Error(`${response.status}: ${response.statusText}`),
+      );
+    }
+    if (!response.ok || response.status !== 200) {
+      return Promise.reject(
+        new Error(`${response.status}: ${response.statusText}`),
+      );
+    }
+
+    const contentType = response.headers.get("Content-Type");
+    if (contentType !== "text/event-stream") {
+      return Promise.reject(
+        `"Content-Type" header is ${contentType} and not "text/event-stream"`,
+      );
+    }
+
+    return Promise.resolve(response);
+  };
+
+  /**
+   * Annouce the connection.
+   * This is done using setTimeout as a means to "queue a task"
+   * @see {@link https://html.spec.whatwg.org/multipage/server-sent-events.html#sse-processing-model}
+   */
+  #announceConnection = () => {
+    if (this.readyState !== ReadyState.CLOSED) {
+      this.#readyState = ReadyState.OPEN;
+    }
+    this.dispatchEvent(new OpenEvent());
+  };
+
+  #processResonse = async (response: Response) => {
     const body = response.body;
     if (!body) throw new Error("missing body");
 
     const reader = body.getReader();
+    const cancelReader = () => reader.cancel();
 
-    // REVIEW: Does response.url count as "the serialization of the origin of the event stream's final URL (i.e., the URL after redirects)"?
+    this.#controller.signal.addEventListener("abort", cancelReader);
+
+    // REVIEW: Does response.#url count as "the serialization of the origin of the event stream's final URL (i.e., the URL after redirects)"?
     await this.#interpretLines(readerToLines(reader), response.url);
 
-    this.#reestablishConnection();
-  }
+    this.#controller.signal.removeEventListener("abort", cancelReader);
+  };
 
   #interpretLines = async (
     lines: AsyncGenerator<string>,
@@ -119,14 +148,14 @@ export class EventSource {
     for await (const line of lines) {
       // An empty line indicates the end of current event.
       if (line === "") {
-        // Replace the last line feed charcter (added when handling fields below)
-        data = data.replace(/\n$/, "");
-
         // Ignore empty events.
         if (data === "") {
           eventType = "";
           continue;
         }
+
+        // Replace the last line feed charcter (added when handling fields below)
+        data = data.replace(/\n$/, "");
 
         // Update the lastEventID if one was sent.
         if (eventID) this.#lastEventID = eventID;
@@ -157,134 +186,90 @@ export class EventSource {
       let value = "";
 
       // Split the field from the value
-      if (firstColonPos > -1) {
+      if (firstColonPos > 0) {
         field = line.slice(0, firstColonPos);
         value = line.slice(firstColonPos + 1).replace(/^ /, "");
       }
 
       // Handle the different fields.
-      switch (field) {
-        case "event":
-          eventType = value;
-          break;
-        case "data":
-          data = data + value + "\n";
-          break;
-        case "id":
-          // Ignore ids that contain NULL (\0).
-          if (value.includes("\0")) continue;
-          eventID = value;
-          break;
-        case "retry":
-          // Only parse the retry field if all characters are ASCII digits.
-          if (!/^[0-9]+$/.test(value)) continue;
-          this.#reconnectionTime = parseInt(value);
+      if (field === "event") {
+        eventType = value;
+      } else if (field === "data") {
+        data = data + value + "\n";
+      } else if (field === "id") {
+        // Ignore ids that contain NULL (\0).
+        if (value.includes("\0")) continue;
+        eventID = value;
+      } else if (field === "retry") {
+        // Only parse the retry field if all characters are ASCII digits.
+        if (!/^[0-9]+$/.test(value)) continue;
+        this.#reconnectionTime = parseInt(value);
+      } else {
+        // Ignore invalid fields.
       }
     }
-  };
-
-  public close(): void {
-    // Declared here for stack tracing.
-    const err = new Error("Connection Closed");
-    queueTask(() => {
-      this.#abortController.abort();
-      if (this.readyState !== ReadyState.CLOSED) {
-        this.dispatchEvent(new ErrorEvent(err));
-      }
-      this.#readyState = ReadyState.CLOSED;
-    });
-  }
-
-  /**
-   * Annouce the connection.
-   * This is done using setTimeout as a means to "queue a task"
-   * @see {@link https://html.spec.whatwg.org/multipage/server-sent-events.html#sse-processing-model}
-   */
-  #announceConnection = () => {
-    if (this.readyState !== ReadyState.CLOSED) {
-      this.#readyState = ReadyState.OPEN;
-    }
-    this.dispatchEvent(new OpenEvent());
   };
 
   /**
    * @see {@link https://html.spec.whatwg.org/multipage/server-sent-events.html#reestablish-the-connection}
    */
-  #reestablishConnection = async () => {
+  #reconnect = async () => {
     // Declared here for stack tracing.
     const err = new Error("Reconnecting");
-    const annoucement = queueMicrotask(() => {
+    const annoucement = queueMicrotask<void>(() => {
       if (this.readyState === ReadyState.CLOSED) {
-        this.close();
-        throw new Error("Connection closed");
+        this.#abort();
+        return;
       }
       this.#readyState = ReadyState.CONNETING;
       this.dispatchEvent(new ErrorEvent(err));
     });
 
-    await sleep(this.reconnectionBackoff);
+    await sleep(this.#reconnectBackoff());
 
     await annoucement;
 
-    await queueMicrotask(() => {
+    queueTask(() => {
       if (this.readyState !== ReadyState.CONNETING) return;
-      this.#abortController = this.startRequest();
+
+      this.#connect();
     });
   };
 
+  #abort = (err?: Error | string) => {
+    err = err || new Error("Connection Closed");
+    queueTask(() => {
+      this.#controller?.abort();
+      if (this.readyState !== ReadyState.CLOSED) {
+        this.dispatchEvent(new ErrorEvent(err));
+      }
+      this.#readyState = ReadyState.CLOSED;
+    });
+  };
+
+  public close(): void {
+    this.#abort();
+  }
+
   /**
-   * Calculates the time to wait for reconnecting to the server using exponential backoff
+   * Calculates the time to wait for reconnecting to the server using exponential #reconnectBackoff
    */
-  get reconnectionBackoff(): number {
+  #reconnectBackoff = (): number => {
     let delay = this.#reconnectionTime / 1000;
     delay = Math.pow(delay, this.#backoffCounter);
     delay = delay * 1000;
     return Math.abs(delay);
-  }
+  };
   #backoffCounter = 1;
 
-  get readyState(): ReadyState {
-    return this.#readyState;
-  }
-
   #messageEventTarget = new EventTarget<MessageEvent>();
-  #onmessageListener?: EventListener<MessageEvent>;
-  set onmessage(listener: EventListener<MessageEvent>) {
-    if (this.#onmessageListener) {
-      this.#messageEventTarget.removeEventListener(
-        "message",
-        this.#onmessageListener,
-      );
-    }
-    this.#onmessageListener = listener;
-    this.#messageEventTarget.addEventListener("message", listener);
-  }
+  public onmessage?: EventListener<MessageEvent>;
 
   #errorEventTarget = new EventTarget<ErrorEvent>();
-  #onerrorListener?: EventListener<ErrorEvent>;
-  set onerror(listener: EventListener<ErrorEvent>) {
-    if (this.#onerrorListener) {
-      this.#errorEventTarget.removeEventListener(
-        "error",
-        this.#onerrorListener,
-      );
-    }
-    this.#onerrorListener = listener;
-    this.#errorEventTarget.addEventListener("error", listener);
-  }
+  public onerror?: EventListener<ErrorEvent>;
 
   #openEventTarget = new EventTarget<OpenEvent>();
-  #onopenListener?: EventListener<OpenEvent>;
-  set onopen(listener: EventListener<OpenEvent>) {
-    if (this.#onopenListener) {
-      this.#openEventTarget.removeEventListener(
-        "open",
-        this.#onopenListener,
-      );
-    }
-    this.#onopenListener = listener;
-    this.#openEventTarget.addEventListener("open", listener);
-  }
+  public onopen?: EventListener<OpenEvent>;
 
   addEventListener(type: "open", listener: EventListener<OpenEvent>): void;
   addEventListener(type: "error", listener: EventListener<ErrorEvent>): void;
@@ -302,16 +287,23 @@ export class EventSource {
         return this.#messageEventTarget.addEventListener(type, listener);
     }
   }
+
   dispatchEvent(event: OpenEvent | MessageEvent | ErrorEvent): boolean {
-    switch (event.type) {
-      case "open":
-        return this.#openEventTarget.dispatchEvent(event);
-      case "error":
-        return this.#errorEventTarget.dispatchEvent(event);
-      default:
-        return this.#messageEventTarget.dispatchEvent(event as MessageEvent);
+    if (event instanceof OpenEvent) {
+      if (typeof this.onopen === "function") this.onopen(event);
+      else if (this.onopen) this.onopen.handleEvent(event);
+      return this.#openEventTarget.dispatchEvent(event);
     }
+    if (event instanceof ErrorEvent) {
+      if (typeof this.onerror === "function") this.onerror(event);
+      else if (this.onerror) this.onerror.handleEvent(event);
+      return this.#errorEventTarget.dispatchEvent(event);
+    }
+    if (typeof this.onmessage === "function") this.onmessage(event);
+    else if (this.onmessage) this.onmessage.handleEvent(event);
+    return this.#messageEventTarget.dispatchEvent(event);
   }
+
   removeEventListener(
     type: string,
     listener: EventListener<OpenEvent | MessageEvent | ErrorEvent>,

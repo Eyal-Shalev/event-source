@@ -1,3 +1,37 @@
+export type WaitGroup = Readonly<{
+  add: (delta: number) => void;
+  done: () => void;
+  wait: () => Promise<void>;
+}>;
+export function waitGroup(): WaitGroup {
+  let counter = 0;
+  const et = new EventTarget();
+
+  return Object.freeze({ add, done, wait });
+
+  function add(delta: number) {
+    console.assert(
+      Number.isSafeInteger(delta),
+      { delta },
+      "Delta must be a safe integer",
+    );
+    counter += delta;
+    counter = Math.max(counter, 0);
+    if (counter === 0) et.dispatchEvent(new Event("done"));
+  }
+
+  function done() {
+    add(-1);
+  }
+
+  function wait() {
+    if (counter === 0) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      et.addEventListener("done", () => resolve());
+    });
+  }
+}
+
 /**
  * @param {number} delay In milliseconds
  * @returns {Promise<void>} Resolves after {delay} milliseconds
@@ -58,21 +92,22 @@ export async function* readerToLines(
     buffer.set(lastBuffer);
     buffer.set(value, lastBuffer.length);
 
-    for (let index = 0, lastIndex = 0; buffer.length > index; index += 1) {
+    let index = 0, lastIndex = 0;
+    for (; index < buffer.length; index++) {
       // Continue if it's a normal character.
       if (![lf, cr, nil].includes(buffer[index])) continue;
 
       // Decode the and yield line
       yield decoder.decode(buffer.slice(lastIndex, index));
 
-      // If the current line ended with nil, then break from the loop.
+      // If the counter line ended with nil, then break from the loop.
       if (buffer[index] === nil) break;
 
-      // increment lastIndex to the current index (plus 1 to ignore the line separator)
+      // increment lastIndex to the counter index (plus 1 to ignore the line separator)
       lastIndex = index + 1;
     }
 
-    lastBuffer = buffer;
+    lastBuffer = buffer.slice(lastIndex);
   }
 }
 
